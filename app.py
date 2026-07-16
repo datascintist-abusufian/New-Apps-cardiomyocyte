@@ -21,12 +21,13 @@ import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import re
+import warnings
+warnings.filterwarnings('ignore')
 
 # --------------------------
-# Safe fallbacks for newer Streamlit APIs used in this app
+# Safe fallbacks for newer Streamlit APIs
 # --------------------------
 if not hasattr(st, "fragment"):
-    # Streamlit <= 1.31: make decorator a no-op
     def _fragment(func):
         return func
     st.fragment = _fragment
@@ -39,12 +40,13 @@ except ImportError:
     ND2_AVAILABLE = False
     print("Warning: nd2reader not installed. Install with: pip install nd2reader")
 
-from analyzers.aging_analyzer import AdvancedCardiomyocyteAnalyzer
-from config import SUPPORTED_IMAGE_FORMATS, SUPPORTED_VIDEO_FORMATS
-
-# Update configuration for 300MB limit and add .nd2
-SUPPORTED_IMAGE_FORMATS_EXTENDED = list(SUPPORTED_IMAGE_FORMATS) + ['nd2']
-MAX_FILE_SIZE_MB = 300  # Increased from 200MB
+# --------------------------
+# Configuration (built-in fallback)
+# --------------------------
+SUPPORTED_IMAGE_FORMATS = ['jpg', 'jpeg', 'png', 'tiff', 'tif', 'bmp']
+SUPPORTED_VIDEO_FORMATS = ['mp4', 'avi', 'mov', 'mkv']
+SUPPORTED_IMAGE_FORMATS_EXTENDED = SUPPORTED_IMAGE_FORMATS + ['nd2']
+MAX_FILE_SIZE_MB = 300
 
 # Set page config
 st.set_page_config(
@@ -53,13 +55,326 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Best-effort server.maxUploadSize (private API; guard to avoid crashes)
-try:
-    if hasattr(st, "_config"):
-        st._config.set_option('server.maxUploadSize', MAX_FILE_SIZE_MB)
-except Exception:
-    pass
+# --------------------------
+# Advanced Analyzer Class (built-in)
+# --------------------------
+class AdvancedCardiomyocyteAnalyzer:
+    """Advanced cardiomyocyte aging analysis with multiple feature extraction methods."""
+    
+    def __init__(self):
+        self.feature_names = [
+            'area', 'perimeter', 'circularity_standard', 'aspect_ratio',
+            'solidity', 'shape_complexity', 'compactness', 'sarcomere_regularity',
+            'mitochondrial_density', 'motion_entropy', 'motion_variability',
+            'motion_smoothness', 'motion_amplitude_std', 'motion_vector_magnitude',
+            'nuclear_area_ratio', 'cytoplasmic_density', 'cell_orientation'
+        ]
+    
+    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        """Enhanced image preprocessing."""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        # Enhance contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(enhanced, h=10)
+        
+        return denoised
+    
+    def extract_morphology_features(self, image: np.ndarray) -> Dict[str, float]:
+        """Extract morphology features from cell image."""
+        features = {}
+        
+        # Threshold and find contours
+        _, thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return {k: 0.0 for k in ['area', 'perimeter', 'circularity_standard', 'aspect_ratio',
+                                    'solidity', 'shape_complexity', 'compactness']}
+        
+        # Get largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Basic measurements
+        area = cv2.contourArea(largest_contour)
+        perimeter = cv2.arcLength(largest_contour, True)
+        features['area'] = float(area)
+        features['perimeter'] = float(perimeter)
+        
+        # Circularity
+        if perimeter > 0:
+            features['circularity_standard'] = float(4 * np.pi * area / (perimeter ** 2))
+        else:
+            features['circularity_standard'] = 0.0
+        
+        # Aspect ratio
+        rect = cv2.minAreaRect(largest_contour)
+        width, height = rect[1]
+        if width > 0 and height > 0:
+            features['aspect_ratio'] = float(max(width, height) / min(width, height))
+        else:
+            features['aspect_ratio'] = 1.0
+        
+        # Solidity
+        hull = cv2.convexHull(largest_contour)
+        hull_area = cv2.contourArea(hull)
+        features['solidity'] = float(area / hull_area) if hull_area > 0 else 0.0
+        
+        # Shape complexity
+        features['shape_complexity'] = float(perimeter / (2 * np.sqrt(np.pi * area))) if area > 0 else 0.0
+        
+        # Compactness
+        features['compactness'] = float((perimeter ** 2) / area) if area > 0 else 0.0
+        
+        return features
+    
+    def extract_sarcomere_features(self, image: np.ndarray) -> float:
+        """Extract sarcomere regularity using FFT analysis."""
+        # Use Fourier transform to detect sarcomere pattern
+        f = np.fft.fft2(image)
+        fshift = np.fft.fftshift(f)
+        magnitude_spectrum = np.log(np.abs(fshift) + 1)
+        
+        # Find peaks in the frequency domain
+        center = np.array(magnitude_spectrum.shape) // 2
+        radius = min(center) // 3
+        mask = np.zeros_like(magnitude_spectrum)
+        cv2.circle(mask, tuple(center), radius, 1, -1)
+        
+        # Calculate regularity score
+        masked_spectrum = magnitude_spectrum * mask
+        peak_intensity = np.max(masked_spectrum)
+        mean_intensity = np.mean(masked_spectrum)
+        
+        regularity = (peak_intensity - mean_intensity) / (peak_intensity + mean_intensity + 1e-6)
+        return float(max(0, min(1, regularity * 2)))
+    
+    def extract_mitochondrial_features(self, image: np.ndarray) -> float:
+        """Extract mitochondrial density using texture analysis."""
+        # Use texture analysis for mitochondrial patterns
+        gray = image.copy()
+        
+        # GLCM-like texture analysis using local variance
+        kernel_size = 5
+        local_var = cv2.blur(gray * gray, (kernel_size, kernel_size)) - cv2.blur(gray, (kernel_size, kernel_size))**2
+        
+        # Normalize and threshold
+        local_var_norm = local_var / (local_var.max() + 1e-6)
+        density = np.mean(local_var_norm > 0.3)
+        
+        return float(density)
+    
+    def extract_motion_features(self, frames: List[np.ndarray]) -> Dict[str, float]:
+        """Extract motion features from video frames."""
+        if not frames or len(frames) < 2:
+            return {
+                'motion_entropy': 0.0,
+                'motion_variability': 0.0,
+                'motion_smoothness': 0.0,
+                'motion_amplitude_std': 0.0,
+                'motion_vector_magnitude': 0.0
+            }
+        
+        # Calculate optical flow between consecutive frames
+        flow_vectors = []
+        for i in range(len(frames) - 1):
+            prev_gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY) if len(frames[i].shape) == 3 else frames[i]
+            curr_gray = cv2.cvtColor(frames[i+1], cv2.COLOR_BGR2GRAY) if len(frames[i+1].shape) == 3 else frames[i+1]
+            
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            magnitude = np.sqrt(flow[:,:,0]**2 + flow[:,:,1]**2)
+            flow_vectors.append(magnitude)
+        
+        if not flow_vectors:
+            return {
+                'motion_entropy': 0.0,
+                'motion_variability': 0.0,
+                'motion_smoothness': 0.0,
+                'motion_amplitude_std': 0.0,
+                'motion_vector_magnitude': 0.0
+            }
+        
+        # Flatten all flow magnitudes
+        all_magnitudes = np.concatenate([f.flatten() for f in flow_vectors])
+        
+        # Calculate features
+        features = {}
+        features['motion_entropy'] = float(-np.sum(all_magnitudes * np.log(all_magnitudes + 1e-6)))
+        features['motion_variability'] = float(np.std(all_magnitudes))
+        features['motion_smoothness'] = float(1.0 / (1.0 + np.std(np.diff(all_magnitudes))))
+        features['motion_amplitude_std'] = float(np.std(all_magnitudes))
+        features['motion_vector_magnitude'] = float(np.mean(all_magnitudes))
+        
+        return features
+    
+    def extract_nuclear_features(self, image: np.ndarray) -> Dict[str, float]:
+        """Extract nuclear features."""
+        # Simple nuclear detection using intensity threshold
+        _, thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Find nuclei (assume smaller, brighter regions)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return {'nuclear_area_ratio': 0.0, 'cytoplasmic_density': 0.0}
+        
+        areas = [cv2.contourArea(c) for c in contours]
+        total_area = sum(areas)
+        
+        if total_area > 0:
+            nuclear_area_ratio = max(areas) / total_area if areas else 0.0
+        else:
+            nuclear_area_ratio = 0.0
+        
+        return {
+            'nuclear_area_ratio': float(nuclear_area_ratio),
+            'cytoplasmic_density': float(1.0 - nuclear_area_ratio)
+        }
+    
+    def comprehensive_aging_analysis(self, file_path: str, is_video: bool = False, 
+                                   sensitivity: float = 1.0) -> Tuple[Dict, Optional[np.ndarray], Optional[np.ndarray], 
+                                                                     np.ndarray, Optional[List], Optional[List]]:
+        """Comprehensive aging analysis with all features."""
+        
+        # Read image
+        if is_video:
+            cap = cv2.VideoCapture(file_path)
+            ret, frame = cap.read()
+            cap.release()
+            if not ret:
+                return {}, None, None, np.array([]), None, None
+            image = frame
+        else:
+            image = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                # Try reading as color
+                image = cv2.imread(file_path)
+                if image is not None:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                else:
+                    return {}, None, None, np.array([]), None, None
+        
+        # Preprocess
+        processed = self.preprocess_image(image)
+        
+        # Extract all features
+        morphology = self.extract_morphology_features(processed)
+        sarcomere = self.extract_sarcomere_features(processed)
+        mitochondrial = self.extract_mitochondrial_features(processed)
+        nuclear = self.extract_nuclear_features(processed)
+        
+        # Combine features
+        features = {**morphology, **nuclear}
+        features['sarcomere_regularity'] = sarcomere
+        features['mitochondrial_density'] = mitochondrial
+        
+        # Add default motion features
+        motion_defaults = {
+            'motion_entropy': 0.0,
+            'motion_variability': 0.0,
+            'motion_smoothness': 0.0,
+            'motion_amplitude_std': 0.0,
+            'motion_vector_magnitude': 0.0
+        }
+        features.update(motion_defaults)
+        
+        # If video, extract motion features
+        motion_signals = None
+        if is_video:
+            frames = []
+            cap = cv2.VideoCapture(file_path)
+            frame_count = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret or frame_count >= 10:
+                    break
+                frames.append(frame)
+                frame_count += 1
+            cap.release()
+            
+            if len(frames) >= 2:
+                motion_features = self.extract_motion_features(frames)
+                features.update(motion_features)
+                motion_signals = [np.array([f.mean() for f in frames])]
+        
+        # Convert to vit_features (for compatibility)
+        vit_features = np.array([features.get(k, 0.0) for k in self.feature_names[:len(features)]])
+        
+        # Adjust features with sensitivity
+        for key in features:
+            if isinstance(features[key], (int, float)):
+                features[key] = features[key] * sensitivity
+        
+        return features, image, processed, vit_features, motion_signals, []
+    
+    def calculate_advanced_aging_score(self, features: Dict, vit_features: np.ndarray) -> Tuple[float, List[str], List[float], str, str, List[str], float]:
+        """Calculate advanced aging score with LIME-like explanations."""
+        
+        # Define feature weights (domain knowledge)
+        weights = {
+            'sarcomere_regularity': 0.15,
+            'mitochondrial_density': 0.12,
+            'motion_entropy': 0.10,
+            'motion_variability': 0.08,
+            'motion_smoothness': 0.07,
+            'motion_vector_magnitude': 0.10,
+            'circularity_standard': 0.08,
+            'aspect_ratio': 0.05,
+            'solidity': 0.05,
+            'shape_complexity': 0.05,
+            'compactness': 0.05,
+            'nuclear_area_ratio': 0.05,
+            'cytoplasmic_density': 0.05
+        }
+        
+        # Calculate weighted score
+        score = 0.0
+        feature_names = []
+        lime_values = []
+        critical_markers = []
+        
+        for feat, weight in weights.items():
+            if feat in features:
+                value = features[feat]
+                # Normalize each feature to [0, 1] range approximately
+                normalized = min(1.0, value * 2)  # Simple normalization
+                contribution = normalized * weight * 100
+                score += contribution
+                feature_names.append(feat)
+                lime_values.append(contribution)
+                
+                # Identify critical markers
+                if feat in ['sarcomere_regularity', 'motion_entropy'] and value > 0.7:
+                    critical_markers.append(f"{feat.replace('_', ' ').title()}: {value:.2f}")
+        
+        # Determine stage
+        if score < 30:
+            stage = "Healthy"
+            stage_color = "#2ca02c"
+        elif score < 50:
+            stage = "Early Aging"
+            stage_color = "#ff7f0e"
+        elif score < 70:
+            stage = "Moderate Aging"
+            stage_color = "#d62728"
+        else:
+            stage = "Advanced Aging"
+            stage_color = "#8B0000"
+        
+        # Confidence (based on feature consistency)
+        confidence = min(0.95, 0.5 + 0.5 * (1.0 - np.std(lime_values) / (np.mean(lime_values) + 1e-6)))
+        
+        return score, feature_names, lime_values, stage, stage_color, critical_markers, confidence
 
+# --------------------------
+# Session State Initialization
+# --------------------------
 def initialize_session_state():
     """Initialize session state variables."""
     if 'analysis_cache' not in st.session_state:
@@ -76,7 +391,16 @@ def initialize_session_state():
         st.session_state.temporal_data = {}
     if 'video_cache' not in st.session_state:
         st.session_state.video_cache = {}
+    if 'available_stages' not in st.session_state:
+        st.session_state.available_stages = []
+    if 'available_days' not in st.session_state:
+        st.session_state.available_days = []
+    if 'stage_filter_initialized' not in st.session_state:
+        st.session_state.stage_filter_initialized = False
 
+# --------------------------
+# Utility Functions
+# --------------------------
 @st.cache_data
 def configure_streamlit():
     """Configure Streamlit custom CSS."""
@@ -102,7 +426,7 @@ def read_nd2_file(file_path: str) -> Optional[np.ndarray]:
         raise ImportError("nd2reader is required for .nd2 files. Install with: pip install nd2reader")
     try:
         with ND2Reader(file_path) as images:
-            # Pick a representative frame: time>0, else middle z, else first
+            # Pick a representative frame
             if images.sizes.get('t', 1) > 1:
                 frame = np.array(images[0])
             elif images.sizes.get('z', 1) > 1:
@@ -126,9 +450,9 @@ def read_nd2_file(file_path: str) -> Optional[np.ndarray]:
 def extract_day_from_filename(filename: str) -> Optional[int]:
     """Extract day number from filename (e.g., 'sample_day3.jpg' -> 3)."""
     patterns = [
-        r'day[\s_-]?(\d+)',      # day1, day_1, day-1, day 1
-        r'(?:^|[_\W])d(\d+)(?:[_\W]|$)',  # d1, d-1 etc (safer word boundaries)
-        r'[\s_-](\d+)[\s_-]?d',  # 1d, 1_d, 1-d
+        r'day[\s_-]?(\d+)',
+        r'(?:^|[_\W])d(\d+)(?:[_\W]|$)',
+        r'[\s_-](\d+)[\s_-]?d',
     ]
     low = filename.lower()
     for p in patterns:
@@ -142,7 +466,7 @@ def extract_day_from_filename(filename: str) -> Optional[int]:
 
 def get_file_hash(file):
     """Generate hash for file content with size check."""
-    file_size = file.size / (1024 * 1024)  # MB
+    file_size = file.size / (1024 * 1024)
     if file_size > MAX_FILE_SIZE_MB:
         st.error(f"File {file.name} exceeds {MAX_FILE_SIZE_MB}MB limit ({file_size:.1f}MB)")
         return None
@@ -150,6 +474,9 @@ def get_file_hash(file):
     file.seek(0)
     return hashlib.md5(file_bytes).hexdigest()
 
+# --------------------------
+# UI Functions
+# --------------------------
 def create_sidebar() -> Dict[str, Any]:
     """Create sidebar with analysis parameters and visualization options."""
     with st.sidebar:
@@ -161,8 +488,16 @@ def create_sidebar() -> Dict[str, Any]:
         sensitivity = st.slider("Sensitivity", 0.1, 2.0, 1.0, 0.1)
 
         st.header("🔎 Filters")
-        stage_filter = st.multiselect("Filter by Stage (optional)", [], help="Will populate after analysis.")
-        day_filter = st.multiselect("Filter by Day (optional)", [], help="Will populate after analysis.")
+        stage_filter = st.multiselect(
+            "Filter by Stage", 
+            st.session_state.get('available_stages', []),
+            help="Select stages to filter"
+        )
+        day_filter = st.multiselect(
+            "Filter by Day", 
+            st.session_state.get('available_days', []),
+            help="Select days to filter"
+        )
 
         st.header("📊 Visualizations")
         options = {
@@ -179,7 +514,6 @@ def create_sidebar() -> Dict[str, Any]:
             'day_filter': day_filter
         }
 
-        # Temporal analysis settings
         if options['show_temporal']:
             st.subheader("📅 Temporal Settings")
             options['temporal_days'] = st.multiselect(
@@ -283,6 +617,7 @@ def process_single_file(analyzer, file_data, temp_dir, sensitivity, cache_dict):
         features, orig, proc, vit_features, motion_signals, contours = analyzer.comprehensive_aging_analysis(
             file_path, is_video, sensitivity
         )
+        
         if not features or orig is None:
             return None
 
@@ -296,7 +631,7 @@ def process_single_file(analyzer, file_data, temp_dir, sensitivity, cache_dict):
         else:
             display_img = orig
 
-        # Normalize lime_values shape: wrap to list for consistency
+        # Normalize lime_values shape
         if isinstance(lime_values, (np.ndarray, list)):
             lv = np.array(lime_values).tolist()
         else:
@@ -391,6 +726,9 @@ def process_uploaded_files_parallel(analyzer: AdvancedCardiomyocyteAnalyzer, upl
                     st.warning(e)
     return results
 
+# --------------------------
+# Visualization Functions
+# --------------------------
 def create_feature_radar_plot(features: Dict, feature_names: List[str], name: str) -> go.Figure:
     """Create radar plot for feature visualization."""
     radar_features = [
@@ -443,16 +781,20 @@ def create_temporal_analysis(results: Dict[str, Any], selected_days: List[int]) 
     for day in sorted(selected_days):
         if day_data[day]['diameter']:
             avg_data['days'].append(day)
-            for key, agg in [
-                ('avg_diameter', np.mean(day_data[day]['diameter'])),
-                ('std_diameter', np.std(day_data[day]['diameter'])),
-                ('avg_circularity', np.mean(day_data[day]['circularity'])),
-                ('std_circularity', np.std(day_data[day]['circularity'])),
-                ('avg_aspect_ratio', np.mean(day_data[day]['aspect_ratio'])),
-                ('std_aspect_ratio', np.std(day_data[day]['aspect_ratio'])),
-                ('avg_score', np.mean(day_data[day]['scores']))
+            # Compute aggregates with proper handling
+            for key, values in [
+                ('avg_diameter', day_data[day]['diameter']),
+                ('std_diameter', day_data[day]['diameter']),
+                ('avg_circularity', day_data[day]['circularity']),
+                ('std_circularity', day_data[day]['circularity']),
+                ('avg_aspect_ratio', day_data[day]['aspect_ratio']),
+                ('std_aspect_ratio', day_data[day]['aspect_ratio']),
+                ('avg_score', day_data[day]['scores'])
             ]:
-                avg_data[key].append(float(agg))
+                if key.startswith('avg_'):
+                    avg_data[key].append(float(np.mean(values)) if values else 0.0)
+                else:
+                    avg_data[key].append(float(np.std(values)) if len(values) > 1 else 0.0)
             avg_data['sample_count'].append(int(len(day_data[day]['diameter'])))
 
     if not avg_data['days']:
@@ -464,18 +806,26 @@ def create_temporal_analysis(results: Dict[str, Any], selected_days: List[int]) 
         subplot_titles=('Average Diameter vs Day', 'Average Circularity vs Day', 'Aspect Ratio vs Day'),
         vertical_spacing=0.12
     )
+    
+    # Add traces with error bars
     fig.add_trace(go.Scatter(
-        x=avg_data['days'], y=avg_data['avg_diameter'], mode='lines+markers',
-        name='Avg Diameter', error_y=dict(type='data', array=avg_data['std_diameter'])
+        x=avg_data['days'], y=avg_data['avg_diameter'], 
+        mode='lines+markers', name='Avg Diameter',
+        error_y=dict(type='data', array=avg_data['std_diameter'])
     ), row=1, col=1)
+    
     fig.add_trace(go.Scatter(
-        x=avg_data['days'], y=avg_data['avg_circularity'], mode='lines+markers',
-        name='Avg Circularity', error_y=dict(type='data', array=avg_data['std_circularity'])
+        x=avg_data['days'], y=avg_data['avg_circularity'], 
+        mode='lines+markers', name='Avg Circularity',
+        error_y=dict(type='data', array=avg_data['std_circularity'])
     ), row=2, col=1)
+    
     fig.add_trace(go.Scatter(
-        x=avg_data['days'], y=avg_data['avg_aspect_ratio'], mode='lines+markers',
-        name='Avg Aspect Ratio', error_y=dict(type='data', array=avg_data['std_aspect_ratio'])
+        x=avg_data['days'], y=avg_data['avg_aspect_ratio'], 
+        mode='lines+markers', name='Avg Aspect Ratio',
+        error_y=dict(type='data', array=avg_data['std_aspect_ratio'])
     ), row=3, col=1)
+    
     fig.update_xaxes(title_text="Day", row=3, col=1)
     fig.update_yaxes(title_text="Diameter (px)", row=1, col=1)
     fig.update_yaxes(title_text="Circularity", row=2, col=1)
@@ -483,14 +833,15 @@ def create_temporal_analysis(results: Dict[str, Any], selected_days: List[int]) 
     fig.update_layout(height=900, title_text="Temporal Pattern Analysis (Day 1-8)", showlegend=False, hovermode='x unified')
     temporal_figs['main'] = fig
 
-    # Sample count
+    # Sample count bar chart
     fig_samples = go.Figure(data=[go.Bar(
-        x=avg_data['days'], y=avg_data['sample_count'], text=avg_data['sample_count'], textposition='auto'
+        x=avg_data['days'], y=avg_data['sample_count'], 
+        text=avg_data['sample_count'], textposition='auto'
     )])
     fig_samples.update_layout(title="Samples per Day", xaxis_title="Day", yaxis_title="Number of Samples", height=300)
     temporal_figs['samples'] = fig_samples
 
-    # NEW: Score trend with linear fit
+    # Score trend with linear fit
     if len(avg_data['days']) >= 2:
         x = np.array(avg_data['days'], dtype=float)
         y = np.array(avg_data['avg_score'], dtype=float)
@@ -500,7 +851,10 @@ def create_temporal_analysis(results: Dict[str, Any], selected_days: List[int]) 
             fig_trend = go.Figure()
             fig_trend.add_trace(go.Scatter(x=x, y=y, mode='markers+lines', name='Avg Score'))
             fig_trend.add_trace(go.Scatter(x=x, y=yfit, mode='lines', name=f'Linear Fit (slope={m:.2f})'))
-            fig_trend.update_layout(title="Average Score vs Day (with linear trend)", xaxis_title="Day", yaxis_title="Avg Score", height=350)
+            fig_trend.update_layout(
+                title="Average Score vs Day (with linear trend)", 
+                xaxis_title="Day", yaxis_title="Avg Score", height=350
+            )
             temporal_figs['score_trend'] = fig_trend
         except Exception:
             pass
@@ -518,6 +872,7 @@ def create_cluster_analysis_cached(features_hash: str, vit_features_hash: str, n
         feature_df = pd.DataFrame(features).select_dtypes(include=[np.number]).fillna(0)
         if feature_df.empty:
             return pd.DataFrame()
+        
         vit_arr = np.array(vit_features, dtype=float)
         if vit_arr.ndim > 2:
             vit_arr = vit_arr.reshape(len(vit_arr), -1)
@@ -541,7 +896,6 @@ def create_cluster_analysis_cached(features_hash: str, vit_features_hash: str, n
         embedding = reducer.fit_transform(scaled)
 
         n_clusters = min(3, scaled.shape[0])
-        # Use integer n_init for older scikit-learn compatibility
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = kmeans.fit_predict(embedding)
 
@@ -574,7 +928,7 @@ def create_cluster_analysis(results: Dict[str, Any]) -> pd.DataFrame:
     )
 
 # --------------------------
-# DISPLAY SECTIONS (existing)
+# Display Functions
 # --------------------------
 @st.fragment
 def display_single_file_analysis(results: Dict[str, Any], options: Dict[str, Any]):
@@ -664,7 +1018,7 @@ def display_single_file_analysis(results: Dict[str, Any], options: Dict[str, Any
 def display_multiple_file_analysis(results: Dict[str, Any], options: Dict[str, Any]):
     st.header(f"📊 Multiple File Analysis ({len(results['names'])} files)")
 
-    # Apply filters if specified (sidebar gets populated after first run)
+    # Apply filters if specified
     names, scores, stages, confidences, critical, days, images = (
         results['names'], results['scores'], results['stages'], results['confidences'],
         results['critical'], results['days'], results['images']
@@ -674,8 +1028,6 @@ def display_multiple_file_analysis(results: Dict[str, Any], options: Dict[str, A
     with st.sidebar:
         st.session_state.available_stages = sorted(list(set(stages)))
         st.session_state.available_days = sorted([d for d in set(days) if d is not None])
-        if not st.session_state.get('stage_filter_initialized', False):
-            st.session_state.stage_filter_initialized = True
 
     mask = np.ones(len(names), dtype=bool)
     if options.get('stage_filter'):
@@ -991,10 +1343,11 @@ def display_advanced_analysis(results: Dict[str, Any]):
         st.plotly_chart(fig_pred, use_container_width=True)
 
 # --------------------------
-# NEW: Additional Analyses
+# NEW: Additional Advanced Analyses
 # --------------------------
 @st.fragment
 def display_pca_and_correlations(results: Dict[str, Any]):
+    """Display PCA and correlation analysis."""
     st.header("🧠 PCA & Correlations")
 
     df = pd.DataFrame(results['features']).select_dtypes(include=[np.number]).fillna(0)
@@ -1014,10 +1367,21 @@ def display_pca_and_correlations(results: Dict[str, Any]):
         'Score': results['scores'],
         'Sample': results['names']
     })
+    
     st.subheader("PCA Scatter (PC1 vs PC2)")
     figp = px.scatter(pca_df, x='PC1', y='PC2', color='Stage', size='Score', hover_name='Sample')
     figp.update_layout(height=450)
     st.plotly_chart(figp, use_container_width=True)
+
+    # Explained variance
+    with st.expander("Explained Variance", expanded=False):
+        var_df = pd.DataFrame({
+            'Component': [f'PC{i+1}' for i in range(len(pca.explained_variance_ratio_))],
+            'Variance': pca.explained_variance_ratio_
+        })
+        fig_var = px.bar(var_df, x='Component', y='Variance', title="Explained Variance Ratio")
+        fig_var.update_layout(height=300)
+        st.plotly_chart(fig_var, use_container_width=True)
 
     st.subheader("Feature Correlation Heatmap")
     corr = np.corrcoef(df.values, rowvar=False)
@@ -1033,7 +1397,7 @@ def display_pca_and_correlations(results: Dict[str, Any]):
     figc.update_layout(title="Correlation Matrix", height=600)
     st.plotly_chart(figc, use_container_width=True)
 
-    # Also show top absolute correlations (excluding self)
+    # Top absolute correlations
     with st.expander("Top |r| feature pairs", expanded=False):
         cols = df.columns.tolist()
         pairs = []
@@ -1044,9 +1408,9 @@ def display_pca_and_correlations(results: Dict[str, Any]):
         topk = pd.DataFrame(pairs[:20], columns=["Feature A", "Feature B", "|r|"])
         st.dataframe(topk, use_container_width=True, height=320)
 
-
 @st.fragment
 def display_outlier_detection(results: Dict[str, Any]):
+    """Display Isolation Forest outlier detection."""
     st.header("🚨 Outlier Detection (Isolation Forest)")
     df = pd.DataFrame(results['features']).select_dtypes(include=[np.number]).fillna(0)
     if df.empty or len(df) < 3:
@@ -1061,10 +1425,9 @@ def display_outlier_detection(results: Dict[str, Any]):
     scaler = StandardScaler()
     X = scaler.fit_transform(df.values)
 
-    # Robust default: auto behavior varies across versions; use contamination from slider
     iso = IsolationForest(n_estimators=n_estimators, contamination=contamination, random_state=42)
-    preds = iso.fit_predict(X)          # -1 = outlier, 1 = inlier
-    scores = -iso.score_samples(X)      # higher = more anomalous
+    preds = iso.fit_predict(X)
+    scores = -iso.score_samples(X)
 
     outlier_mask = (preds == -1)
     res_df = pd.DataFrame({
@@ -1078,7 +1441,7 @@ def display_outlier_detection(results: Dict[str, Any]):
     with c2:
         st.metric("Detected outliers", f"{int(outlier_mask.sum())} / {len(outlier_mask)}")
 
-    # Quick 2D projection (PCA) colored by outlier flag
+    # PCA projection colored by outlier flag
     pca = PCA(n_components=2, random_state=42)
     pc = pca.fit_transform(X)
     pca_plot = pd.DataFrame({
@@ -1094,9 +1457,57 @@ def display_outlier_detection(results: Dict[str, Any]):
     with st.expander("Outlier table (sorted by anomaly score)", expanded=True):
         st.dataframe(res_df, use_container_width=True, height=360)
 
+# --------------------------
+# NEW: Batch Processing and Report Generation
+# --------------------------
+@st.fragment
+def display_batch_comparison(results: Dict[str, Any]):
+    """Display batch comparison analysis."""
+    st.header("📊 Batch Comparison")
+    
+    if len(results['names']) < 2:
+        st.info("Need at least 2 samples for batch comparison.")
+        return
+    
+    # Group by stage
+    stage_groups = {}
+    for i, stage in enumerate(results['stages']):
+        if stage not in stage_groups:
+            stage_groups[stage] = []
+        stage_groups[stage].append(i)
+    
+    # Create comparison plots
+    metrics = ['sarcomere_regularity', 'mitochondrial_density', 'motion_entropy', 'circularity_standard']
+    fig = make_subplots(rows=2, cols=2, subplot_titles=metrics)
+    
+    for idx, metric in enumerate(metrics):
+        row = idx // 2 + 1
+        col = idx % 2 + 1
+        for stage, indices in stage_groups.items():
+            values = [results['features'][i].get(metric, 0) for i in indices]
+            fig.add_trace(go.Box(y=values, name=stage, legendgroup=stage), row=row, col=col)
+    
+    fig.update_layout(height=600, title="Feature Distribution by Stage")
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Statistical comparison
+    with st.expander("Statistical Comparison", expanded=False):
+        comp_data = []
+        for stage, indices in stage_groups.items():
+            for i in indices:
+                comp_data.append({
+                    'Stage': stage,
+                    'Sample': results['names'][i],
+                    'Score': results['scores'][i],
+                    'Sarcomere': results['features'][i].get('sarcomere_regularity', 0),
+                    'Mitochondrial': results['features'][i].get('mitochondrial_density', 0),
+                    'Motion': results['features'][i].get('motion_entropy', 0)
+                })
+        comp_df = pd.DataFrame(comp_data)
+        st.dataframe(comp_df, use_container_width=True, height=300)
 
 def generate_report(results: Dict[str, Any]):
-    """Generate analysis report."""
+    """Generate comprehensive analysis report."""
     st.header("📋 Report Generation")
     c1, c2 = st.columns([3, 1])
     with c1:
@@ -1105,50 +1516,74 @@ def generate_report(results: Dict[str, Any]):
         if st.button("📄 Generate", type="primary", key="generate_report"):
             try:
                 feature_df = pd.DataFrame(results['features']).select_dtypes(include=[np.number]).fillna(0)
+                
+                # Calculate summary statistics
                 sar_mean = np.mean([f.get('sarcomere_regularity', 0) for f in results['features']]) if len(results['features']) else 0
                 mot_entropy_mean = np.mean([f.get('motion_entropy', 0) for f in results['features']]) if len(results['features']) else 0
                 vec_mean = np.mean([f.get('motion_vector_magnitude', 0) for f in results['features']]) if len(results['features']) else 0
                 mito_mean = np.mean([f.get('mitochondrial_density', 0) for f in results['features']]) if len(results['features']) else 0
 
+                # Stage distribution
+                stage_counts = pd.Series(results['stages']).value_counts().to_dict()
+
                 report = f"""# Cardiomyocyte Aging Analysis Report
+## Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ## Executive Summary
 - **Total Samples Analyzed**: {len(results['scores'])}
 - **Average Aging Score**: {np.mean(results['scores']):.1f}/100
 - **Score Range**: {np.min(results['scores']):.1f} - {np.max(results['scores']):.1f}
-- **Primary Classification**: {results['stages'][0] if len(set(results['stages'])) == 1 and len(results['stages'])>0 else 'Multiple Classifications'}
+- **Score Std Dev**: {np.std(results['scores']):.2f}
 - **Average Confidence**: {np.mean([float(c) for c in results['confidences']]):.2%}
 
-## Key Metrics Summary
-| Metric | Mean Value |
-|--------|------------|
-| Sarcomere Regularity | {sar_mean:.4f} |
-| Motion Entropy | {mot_entropy_mean:.4f} |
-| Motion Vector Magnitude | {vec_mean:.4f} |
-| Mitochondrial Density | {mito_mean:.4f} |
+## Stage Distribution
+"""
+                for stage, count in stage_counts.items():
+                    report += f"- **{stage}**: {count} samples ({count/len(results['scores'])*100:.1f}%)\n"
 
-## Sample Details (First 20)
+                report += f"""
+## Key Metrics Summary
+| Metric | Mean Value | Std Dev | Min | Max |
+|--------|------------|---------|-----|-----|
+| Sarcomere Regularity | {sar_mean:.4f} | {np.std([f.get('sarcomere_regularity', 0) for f in results['features']]):.4f} | {min([f.get('sarcomere_regularity', 0) for f in results['features']]):.4f} | {max([f.get('sarcomere_regularity', 0) for f in results['features']]):.4f} |
+| Motion Entropy | {mot_entropy_mean:.4f} | {np.std([f.get('motion_entropy', 0) for f in results['features']]):.4f} | {min([f.get('motion_entropy', 0) for f in results['features']]):.4f} | {max([f.get('motion_entropy', 0) for f in results['features']]):.4f} |
+| Motion Vector Magnitude | {vec_mean:.4f} | {np.std([f.get('motion_vector_magnitude', 0) for f in results['features']]):.4f} | {min([f.get('motion_vector_magnitude', 0) for f in results['features']]):.4f} | {max([f.get('motion_vector_magnitude', 0) for f in results['features']]):.4f} |
+| Mitochondrial Density | {mito_mean:.4f} | {np.std([f.get('mitochondrial_density', 0) for f in results['features']]):.4f} | {min([f.get('mitochondrial_density', 0) for f in results['features']]):.4f} | {max([f.get('mitochondrial_density', 0) for f in results['features']]):.4f} |
+
+## Sample Details
 | Sample | Score | Stage | Confidence | Day |
 |--------|-------|-------|------------|-----|
-""" + "\n".join([f"| {n[:30]} | {s:.1f} | {stg} | {float(c):.1%} | {d if d else 'N/A'} |"
-                 for n, s, stg, c, d in zip(results['names'][:20], results['scores'][:20],
-                                            results['stages'][:20], results['confidences'][:20],
-                                            results['days'][:20])])
+"""
+                for n, s, stg, c, d in zip(results['names'][:20], results['scores'][:20],
+                                          results['stages'][:20], results['confidences'][:20],
+                                          results['days'][:20]):
+                    report += f"| {n[:30]} | {s:.1f} | {stg} | {float(c):.1%} | {d if d else 'N/A'} |\n"
 
                 if len(results['names']) > 20:
-                    report += f"\n\n*Showing first 20 of {len(results['names'])} samples*"
+                    report += f"\n*Showing first 20 of {len(results['names'])} samples*"
 
+                # Critical markers
                 crit_list = [m for c in results['critical'] for m in (c.split(', ') if c != 'None' else [])]
-                report += f"""
+                if crit_list:
+                    report += f"""
 
 ## Critical Markers Identified
-{', '.join(sorted(set(crit_list))) or 'No critical markers identified'}
+{', '.join(sorted(set(crit_list)))}
 
+### Critical Marker Frequency
+"""
+                    crit_freq = pd.Series(crit_list).value_counts()
+                    for marker, freq in crit_freq.items():
+                        report += f"- {marker}: {freq} occurrences\n"
+                else:
+                    report += "\n## Critical Markers\nNo critical markers identified.\n"
+
+                report += f"""
 ## Feature Columns
 {', '.join(feature_df.columns.tolist()) if not feature_df.empty else 'No numeric features available.'}
 
 ---
-*Generated by Cardiomyocyte Aging Analysis System*
+*Generated by Cardiomyocyte Aging Analysis System v2.1*
 """
                 with st.expander("📄 View Report", expanded=True):
                     st.text_area("Report Content", report, height=400, key="report_text")
@@ -1162,7 +1597,9 @@ def generate_report(results: Dict[str, Any]):
             except Exception as e:
                 st.error(f"Error generating report: {str(e)}")
 
-
+# --------------------------
+# Main Application
+# --------------------------
 def main():
     """Main application function with optimized flow."""
     initialize_session_state()
@@ -1202,16 +1639,18 @@ def main():
 
         st.success(f"✅ Successfully analyzed {len(results['features'])} file(s)")
 
-        # Optional temporal analysis section gated by the toggle
+        # Optional temporal analysis
         if temporal_button and options['show_temporal']:
             display_temporal_analysis(results, options)
             st.divider()
 
-        # Tabs
+        # Main tabs
         if len(results['features']) == 1:
-            tab_names = ["📊 Main Analysis", "🗺️ Clustering", "🏃 Motion", "🔬 Morphology", "📈 Advanced", "🧠 PCA & Corr", "🚨 Outliers"]
+            tab_names = ["📊 Main Analysis", "🗺️ Clustering", "🏃 Motion", "🔬 Morphology", 
+                        "📈 Advanced", "🧠 PCA & Corr", "🚨 Outliers", "📊 Batch Comparison"]
         else:
-            tab_names = ["📊 Overview", "🗺️ Clustering", "🏃 Motion", "🔬 Morphology", "📈 Advanced", "🧠 PCA & Corr", "🚨 Outliers"]
+            tab_names = ["📊 Overview", "🗺️ Clustering", "🏃 Motion", "🔬 Morphology", 
+                        "📈 Advanced", "🧠 PCA & Corr", "🚨 Outliers", "📊 Batch Comparison"]
         tabs = st.tabs(tab_names)
 
         with tabs[0]:
@@ -1243,6 +1682,9 @@ def main():
         with tabs[6]:
             display_outlier_detection(results)
 
+        with tabs[7]:
+            display_batch_comparison(results)
+
         st.divider()
         generate_report(results)
 
@@ -1257,16 +1699,21 @@ def main():
 
 **Highlights**
 - Unlimited file uploads, {MAX_FILE_SIZE_MB}MB per file
-- ND2 support {"(Active)" if ND2_AVAILABLE else "(Install nd2reader)"}
+- ND2 support {"✅ (Active)" if ND2_AVAILABLE else "❌ (Install nd2reader)"}
 - Temporal day 1–8 analysis (filename-based)
 - UMAP clustering, PCA visualization
 - LIME biomarker summaries
 - Motion & morphology dashboards
 - IsolationForest outlier detection
-- Report generator
+- Batch comparison analysis
+- Comprehensive report generator
+
+**Supported Features**
+- Image formats: JPG, PNG, TIFF, BMP, ND2
+- Video formats: MP4, AVI, MOV, MKV
+- Parallel processing for large batches
+- Interactive visualizations with Plotly
         """)
 
-
 if __name__ == "__main__":
-    # Windows event loop fix is unnecessary unless using asyncio; keep minimal
     main()
